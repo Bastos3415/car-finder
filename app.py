@@ -1,4 +1,5 @@
 import re
+import json
 import time
 import requests
 import pandas as pd
@@ -59,7 +60,7 @@ def estimate_fr_price(make: str, model: str, year: int, km: int, fuel: str) -> i
         price -= ((km - 150_000) // 10_000) * 200
 
     # bonus diesel
-    if fuel.lower() == "diesel":
+    if (fuel or "").lower() == "diesel":
         price += 300
 
     return int(max(price, 2000))
@@ -98,7 +99,7 @@ def liquidity_score(make: str, model: str, km: int, seller_type: str) -> int:
 
 
 # ---------------------------
-# Fetch + parse page detail mobile.de
+# Fetch page detail mobile.de
 # ---------------------------
 @st.cache_data(ttl=900)
 def fetch_detail_page(url: str) -> str:
@@ -107,75 +108,137 @@ def fetch_detail_page(url: str) -> str:
     return r.text
 
 
+def _safe_int(x):
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return int(x)
+        s = str(x).strip()
+        s = s.replace(".", "").replace(",", "")
+        return int(s)
+    except Exception:
+        return None
+
+
 def parse_detail(html: str, url: str) -> dict:
     """
-    Extraction best effort depuis une page detail mobile.de.
+    Version robuste: on essaie d'abord le JSON structuré (application/ld+json).
+    Fallback ensuite sur texte brut.
     """
     soup = BeautifulSoup(html, "lxml")
-    full_text = soup.get_text(" ", strip=True)
 
-    # Titre
-    title = ""
-    h = soup.find(["h1", "h2"])
-    if h:
-        title = h.get_text(" ", strip=True)
+    title = soup.find("h1").get_text(" ", strip=True) if soup.find("h1") else ""
 
-    # Prix
-    price = None
-    # Exemple patterns : "€5,490" ou "5.490 €"
-    m = re.search(r"€\s?([\d\.\,]+)", full_text)
-    if not m:
-        m = re.search(r"([\d\.\,]+)\s?€", full_text)
-    if m:
-        raw = m.group(1).replace(".", "").replace(",", "")
-        if raw.isdigit():
-            price = int(raw)
+    # ---------------------------
+    # 1) JSON structuré (le plus fiable)
+    # ---------------------------
+    car_json = None
+    for script in soup.find_all("script", type="application/ld+json"):
+        text = script.string
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+        except Exception:
+            continue
 
-    # Km
-    km = None
-    m = re.search(r"(\d{1,3}[\.\,]?\d{3})\s?km", full_text, re.IGNORECASE)
-    if m:
-        raw = m.group(1).replace(".", "").replace(",", "")
-        if raw.isdigit():
-            km = int(raw)
+        # parfois c'est une liste, parfois un dict
+        candidates = obj if isinstance(obj, list) else [obj]
+        for c in candidates:
+            if isinstance(c, dict) and c.get("@type") in ("Car", "Vehicle"):
+                car_json = c
+                break
+        if car_json:
+            break
 
-    # Year (First registration souvent 07/2011)
-    year = None
-    m = re.search(r"\b(\d{2})/(\d{4})\b", full_text)
-    if m:
-        year = int(m.group(2))
-
-    # Fuel
-    if "Diesel" in full_text:
-        fuel = "diesel"
-    elif "Benzin" in full_text or "Petrol" in full_text:
-        fuel = "essence"
-    else:
-        fuel = "diesel"
-
-    # Transmission
-    transmission = "manual"
-    if "Automatic" in full_text or "Automatik" in full_text:
-        transmission = "automatic"
-
-    # Seller type (best effort)
-    seller_type = "professional" if ("Händler" in full_text or "Dealer" in full_text or "dealer" in full_text.lower()) else "private"
-
-    # Guess make/model (simple)
     make = "Autre"
     model = "Autre"
-    makes = ["Volkswagen", "Skoda", "Peugeot", "Renault", "Ford", "Audi"]
-    models = ["Golf", "Octavia", "308", "Megane", "Focus", "Polo", "A3"]
+    year = None
+    km = None
+    price = None
+    fuel = "diesel"
 
-    for mk in makes:
-        if mk.lower() in full_text.lower():
-            make = mk
-            break
+    if car_json:
+        # brand peut être string ou dict
+        brand = car_json.get("brand")
+        if isinstance(brand, dict):
+            make = brand.get("name") or make
+        elif isinstance(brand, str):
+            make = brand
 
-    for md in models:
-        if re.search(rf"\b{re.escape(md)}\b", full_text, re.IGNORECASE):
-            model = md
-            break
+        model = car_json.get("model") or model
+
+        # année
+        prod_date = car_json.get("productionDate")
+        year = _safe_int(prod_date)
+
+        # km
+        mileage = car_json.get("mileageFromOdometer")
+        if isinstance(mileage, dict):
+            km = _safe_int(mileage.get("value"))
+        else:
+            km = _safe_int(mileage)
+
+        # fuelType (parfois list)
+        ft = car_json.get("fuelType")
+        if isinstance(ft, list) and ft:
+            fuel = str(ft[0]).lower()
+        elif isinstance(ft, str):
+            fuel = ft.lower()
+
+        # prix
+        offers = car_json.get("offers")
+        if isinstance(offers, dict):
+            price = _safe_int(offers.get("price"))
+        elif isinstance(offers, list) and offers:
+            if isinstance(offers[0], dict):
+                price = _safe_int(offers[0].get("price"))
+
+    # ---------------------------
+    # 2) Fallback texte brut si manques
+    # ---------------------------
+    full_text = soup.get_text(" ", strip=True)
+
+    if price is None:
+        m = re.search(r"€\s?([\d\.\,]+)", full_text)
+        if not m:
+            m = re.search(r"([\d\.\,]+)\s?€", full_text)
+        if m:
+            price = _safe_int(m.group(1))
+
+    if km is None:
+        m = re.search(r"(\d{1,3}[\.\,]?\d{3})\s?km", full_text, re.IGNORECASE)
+        if m:
+            km = _safe_int(m.group(1))
+
+    if year is None:
+        m = re.search(r"\b(\d{2})/(\d{4})\b", full_text)
+        if m:
+            year = _safe_int(m.group(2))
+
+    # transmission / vendeur (best effort)
+    transmission = "automatic" if ("Automatik" in full_text or "Automatic" in full_text) else "manual"
+    seller_type = "professional" if ("Händler" in full_text or "Dealer" in full_text or "dealer" in full_text.lower()) else "private"
+
+    # normalisation make/model si JSON n'a rien donné
+    if make == "Autre":
+        for mk in ["Volkswagen", "Skoda", "Peugeot", "Renault", "Ford", "Audi"]:
+            if mk.lower() in full_text.lower():
+                make = mk
+                break
+    if model == "Autre":
+        for md in ["Golf", "Octavia", "308", "Megane", "Focus", "Polo", "A3"]:
+            if re.search(rf"\b{re.escape(md)}\b", full_text, re.IGNORECASE):
+                model = md
+                break
+
+    # normalise fuel
+    if "diesel" not in (fuel or "").lower():
+        if "Diesel" in full_text:
+            fuel = "diesel"
+        elif "Benzin" in full_text or "Petrol" in full_text:
+            fuel = "essence"
 
     return {
         "make": make,
@@ -202,6 +265,7 @@ def analyze_row(row: dict) -> dict:
 
     fr_est = estimate_fr_price(make, model, year, km, fuel)
     costs = estimate_import_costs(km, timing_belt_known=False)
+
     margin = None
     if isinstance(price_de, int) and price_de > 0:
         margin = fr_est - (price_de + costs)
@@ -229,10 +293,7 @@ def analyze_row(row: dict) -> dict:
 # UI - Mode liens d'annonces
 # ---------------------------
 st.subheader("1) Colle des liens d'annonces mobile.de (1 par ligne)")
-
-st.write(
-    "Ouvre des annonces sur mobile.de, copie les liens (details.html?id=...), colle-les ici puis clique 'Analyser les liens'."
-)
+st.write("Ouvre des annonces sur mobile.de, copie les liens (details.html?id=...), colle-les ici puis clique 'Analyser'.")
 
 links_text = st.text_area(
     "Liens mobile.de",
@@ -241,6 +302,7 @@ links_text = st.text_area(
 )
 
 limit = st.slider("Nombre de liens a analyser", 1, 30, 10)
+
 
 def clean_links(text: str) -> list[str]:
     urls = []
@@ -261,7 +323,7 @@ def clean_links(text: str) -> list[str]:
     return uniq
 
 
-if st.button("Analyser les liens"):
+if st.button("Analyser"):
     urls = clean_links(links_text)
 
     if not urls:
@@ -273,7 +335,7 @@ if st.button("Analyser les liens"):
 
     details = []
     with st.spinner("Lecture des annonces..."):
-        for i, url in enumerate(urls, start=1):
+        for url in urls:
             try:
                 dhtml = fetch_detail_page(url)
                 d = parse_detail(dhtml, url)
@@ -326,4 +388,4 @@ if st.button("Analyser les liens"):
             f"{row.get('url')}"
         )
 
-st.caption("MVP: si certaines infos ne sortent pas (prix/km/annee), on ajustera le parseur des pages details.")
+st.caption("MVP: si une annonce retourne encore des champs vides, envoie-moi le lien et je te renforce le parseur pour ce format.")
